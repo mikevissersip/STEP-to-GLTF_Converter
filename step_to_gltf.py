@@ -19,22 +19,77 @@ from OCP.BRepMesh import BRepMesh_IncrementalMesh
 from OCP.IFSelect import IFSelect_ReturnStatus
 from OCP.Quantity import Quantity_Color
 from OCP.STEPCAFControl import STEPCAFControl_Reader
-from OCP.STEPControl import STEPControl_Reader
 from OCP.TCollection import TCollection_ExtendedString
-from OCP.TDF import TDF_LabelSequence
+from OCP.TDF import TDF_Label, TDF_LabelSequence
 from OCP.TDocStd import TDocStd_Document
 from OCP.TopAbs import TopAbs_FACE
 from OCP.TopExp import TopExp_Explorer
 from OCP.TopLoc import TopLoc_Location
 from OCP.TopoDS import TopoDS
 from OCP.XCAFApp import XCAFApp_Application
-from OCP.XCAFDoc import XCAFDoc_ColorType, XCAFDoc_DocumentTool
+from OCP.XCAFDoc import XCAFDoc_ColorType, XCAFDoc_DocumentTool, XCAFDoc_ShapeTool
 
 
 DEFAULT_COLOR = (0.69, 0.69, 0.69, 1.0)
 
 
-def _read_step(path: Path) -> tuple[object, object, object, list[tuple[float, float, float, float]]]:
+def _color_for_shape(color_tool: object, shape: object) -> tuple[float, float, float, float]:
+    color = Quantity_Color()
+    for color_type in (
+        XCAFDoc_ColorType.XCAFDoc_ColorSurf,
+        XCAFDoc_ColorType.XCAFDoc_ColorGen,
+        XCAFDoc_ColorType.XCAFDoc_ColorCurv,
+    ):
+        if color_tool.GetColor(shape, color_type, color):
+            return (float(color.Red()), float(color.Green()), float(color.Blue()), 1.0)
+    return DEFAULT_COLOR
+
+
+def _color_for_component(color_tool: object, component: object, definition: object) -> tuple[float, float, float, float]:
+    instance_color = Quantity_Color()
+    if color_tool.GetInstanceColor(component, XCAFDoc_ColorType.XCAFDoc_ColorSurf, instance_color):
+        return (float(instance_color.Red()), float(instance_color.Green()), float(instance_color.Blue()), 1.0)
+    color = _color_for_shape(color_tool, component)
+    if color != DEFAULT_COLOR:
+        return color
+    return _color_for_shape(color_tool, definition)
+
+
+def _colored_components(
+    label: object,
+    shape_tool: object,
+    color_tool: object,
+    parent_location: TopLoc_Location | None = None,
+):
+    parent_location = parent_location or TopLoc_Location()
+    if not XCAFDoc_ShapeTool.IsAssembly_s(label):
+        shape = shape_tool.GetShape_s(label)
+        if not shape.IsNull():
+            yield shape, [color for _, color in _walk_faces(shape, color_tool)]
+        return
+
+    components = TDF_LabelSequence()
+    XCAFDoc_ShapeTool.GetComponents_s(label, components)
+    for index in range(1, components.Length() + 1):
+        component = components.Value(index)
+        referred = TDF_Label()
+        target = referred if XCAFDoc_ShapeTool.GetReferredShape_s(component, referred) else component
+        component_shape = shape_tool.GetShape_s(component)
+        location = parent_location.Multiplied(component_shape.Location())
+        if XCAFDoc_ShapeTool.IsAssembly_s(target):
+            yield from _colored_components(target, shape_tool, color_tool, location)
+            continue
+        target_shape = shape_tool.GetShape_s(target)
+        if not target_shape.IsNull():
+            shape = target_shape.Located(TopLoc_Location()).Located(location)
+            colors = [color for _, color in _walk_faces(target_shape, color_tool)]
+            component_color = _color_for_component(color_tool, component_shape, target_shape)
+            if all(color == DEFAULT_COLOR for color in colors):
+                colors = [component_color] * len(colors)
+            yield shape, colors
+
+
+def _read_step(path: Path) -> tuple[object, list[tuple[object, list[tuple[float, float, float, float]]]]]:
     reader = STEPCAFControl_Reader()
     reader.SetColorMode(True)
     reader.SetNameMode(True)
@@ -49,21 +104,15 @@ def _read_step(path: Path) -> tuple[object, object, object, list[tuple[float, fl
     shape_tool = XCAFDoc_DocumentTool.ShapeTool_s(document.Main())
     color_tool = XCAFDoc_DocumentTool.ColorTool_s(document.Main())
     roots = TDF_LabelSequence()
-    shape_tool.GetShapes(roots)
+    shape_tool.GetFreeShapes(roots)
     if roots.Length() == 0:
         raise RuntimeError("The STEP file does not contain a transferable shape")
-    colors = []
+    colored_shapes = []
     for index in range(1, roots.Length() + 1):
-        shape = shape_tool.GetShape_s(roots.Value(index))
-        if not shape.IsNull():
-            colors.extend(color for _, color in _walk_faces(shape, color_tool))
-
-    geometry_reader = STEPControl_Reader()
-    if geometry_reader.ReadFile(str(path)) != IFSelect_ReturnStatus.IFSelect_RetDone:
-        raise RuntimeError(f"Could not read STEP geometry: {path}")
-    if geometry_reader.TransferRoots() == 0:
-        raise RuntimeError(f"Could not transfer STEP geometry: {path}")
-    return document, geometry_reader.OneShape(), colors
+        colored_shapes.extend(_colored_components(roots.Value(index), shape_tool, color_tool))
+    if not colored_shapes:
+        raise RuntimeError("The STEP file does not contain a transferable colored shape")
+    return document, colored_shapes
 
 
 def _color_for_face(color_tool: object, face: object) -> tuple[float, float, float, float]:
@@ -94,35 +143,36 @@ def _normal(a: tuple[float, float, float], b: tuple[float, float, float], c: tup
     return nx / length, ny / length, nz / length
 
 
-def _tessellate(shape: object, colors: list[tuple[float, float, float, float]], deflection: float):
+def _tessellate(colored_shapes: list[tuple[object, list[tuple[float, float, float, float]]]], deflection: float):
     groups: dict[tuple[float, float, float, float], tuple[list[float], list[float], list[int]]] = defaultdict(
         lambda: ([], [], [])
     )
-    BRepMesh_IncrementalMesh(shape, deflection, False, math.radians(12), False)
-    for face_index, (face, _) in enumerate(_walk_faces(shape)):
-                color = colors[face_index] if face_index < len(colors) else DEFAULT_COLOR
-                location = TopLoc_Location()
-                triangulation = BRep_Tool.Triangulation_s(face, location)
-                if triangulation is None:
-                    continue
-                positions, normals, indices = groups[color]
-                offset = len(positions) // 3
-                transformation = location.Transformation()
-                for node_index in range(1, triangulation.NbNodes() + 1):
-                    point = triangulation.Node(node_index).Transformed(transformation)
-                    positions.extend((point.X() * 0.001, point.Y() * 0.001, point.Z() * 0.001))
-                    normals.extend((0.0, 0.0, 0.0))
-                for triangle_index in range(1, triangulation.NbTriangles() + 1):
-                    triangle = triangulation.Triangle(triangle_index)
-                    first, second, third = triangle.Get()
-                    a = tuple(positions[(offset + first - 1) * 3 : (offset + first) * 3])
-                    b = tuple(positions[(offset + second - 1) * 3 : (offset + second) * 3])
-                    c = tuple(positions[(offset + third - 1) * 3 : (offset + third) * 3])
-                    face_normal = _normal(a, b, c)
-                    for vertex in (first, second, third):
-                        normal_offset = (offset + vertex - 1) * 3
-                        normals[normal_offset : normal_offset + 3] = face_normal
-                    indices.extend((offset + first - 1, offset + second - 1, offset + third - 1))
+    for shape, colors in colored_shapes:
+        BRepMesh_IncrementalMesh(shape, deflection, False, math.radians(12), False)
+        for face_index, (face, _) in enumerate(_walk_faces(shape)):
+            color = colors[face_index] if face_index < len(colors) else DEFAULT_COLOR
+            location = TopLoc_Location()
+            triangulation = BRep_Tool.Triangulation_s(face, location)
+            if triangulation is None:
+                continue
+            positions, normals, indices = groups[color]
+            offset = len(positions) // 3
+            transformation = location.Transformation()
+            for node_index in range(1, triangulation.NbNodes() + 1):
+                point = triangulation.Node(node_index).Transformed(transformation)
+                positions.extend((point.X() * 0.001, point.Y() * 0.001, point.Z() * 0.001))
+                normals.extend((0.0, 0.0, 0.0))
+            for triangle_index in range(1, triangulation.NbTriangles() + 1):
+                triangle = triangulation.Triangle(triangle_index)
+                first, second, third = triangle.Get()
+                a = tuple(positions[(offset + first - 1) * 3 : (offset + first) * 3])
+                b = tuple(positions[(offset + second - 1) * 3 : (offset + second) * 3])
+                c = tuple(positions[(offset + third - 1) * 3 : (offset + third) * 3])
+                face_normal = _normal(a, b, c)
+                for vertex in (first, second, third):
+                    normal_offset = (offset + vertex - 1) * 3
+                    normals[normal_offset : normal_offset + 3] = face_normal
+                indices.extend((offset + first - 1, offset + second - 1, offset + third - 1))
     return groups
 
 
@@ -190,8 +240,8 @@ def main() -> None:
     output = args.output or args.input.with_suffix(".gltf")
     if args.deflection <= 0:
         parser.error("--deflection must be greater than zero")
-    document, shape, colors = _read_step(args.input)
-    groups = _tessellate(shape, colors, args.deflection)
+    document, colored_shapes = _read_step(args.input)
+    groups = _tessellate(colored_shapes, args.deflection)
     if not groups:
         raise RuntimeError("No tessellated faces were found")
     output.parent.mkdir(parents=True, exist_ok=True)
