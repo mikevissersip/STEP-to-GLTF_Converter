@@ -3,6 +3,8 @@
 This CLI converts `.stp`/`.step` files to a meter-scaled glTF 2.0 file and a
 same-name external `.bin` buffer. STEP surface/general colors are preserved as
 glTF PBR base colors.
+Each STEP component is exported as its own glTF mesh and scene node, so Blender imports
+the parts as separate objects that can be moved and edited independently.
 
 ## Setup
 

@@ -1,0 +1,1 @@
+To be converted .step or .stp files must be placed in this folder.

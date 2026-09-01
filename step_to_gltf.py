@@ -144,10 +144,10 @@ def _normal(a: tuple[float, float, float], b: tuple[float, float, float], c: tup
 
 
 def _tessellate(colored_shapes: list[tuple[object, list[tuple[float, float, float, float]]]], deflection: float):
-    groups: dict[tuple[float, float, float, float], tuple[list[float], list[float], list[int]]] = defaultdict(
+    groups: dict[tuple[int, tuple[float, float, float, float]], tuple[list[float], list[float], list[int]]] = defaultdict(
         lambda: ([], [], [])
     )
-    for shape, colors in colored_shapes:
+    for shape_index, (shape, colors) in enumerate(colored_shapes):
         BRepMesh_IncrementalMesh(shape, deflection, False, math.radians(12), False)
         for face_index, (face, _) in enumerate(_walk_faces(shape)):
             color = colors[face_index] if face_index < len(colors) else DEFAULT_COLOR
@@ -155,7 +155,7 @@ def _tessellate(colored_shapes: list[tuple[object, list[tuple[float, float, floa
             triangulation = BRep_Tool.Triangulation_s(face, location)
             if triangulation is None:
                 continue
-            positions, normals, indices = groups[color]
+            positions, normals, indices = groups[(shape_index, color)]
             offset = len(positions) // 3
             transformation = location.Transformation()
             for node_index in range(1, triangulation.NbNodes() + 1):
@@ -188,10 +188,12 @@ def write_gltf(groups: dict, output: Path) -> None:
     binary = bytearray()
     accessors = []
     buffer_views = []
-    primitives = []
+    meshes = []
+    nodes = []
     materials = []
+    primitives_by_shape: dict[int, list[dict]] = defaultdict(list)
 
-    for material_index, (color, (positions, normals, indices)) in enumerate(groups.items()):
+    for material_index, ((shape_index, color), (positions, normals, indices)) in enumerate(groups.items()):
         position_offset, position_bytes = _append_f32(binary, positions)
         normal_offset, normal_bytes = _append_f32(binary, normals)
         while len(binary) % 4:
@@ -214,14 +216,19 @@ def write_gltf(groups: dict, output: Path) -> None:
         index_accessor = len(accessors)
         accessors.append({"type": "SCALAR", "componentType": 5125, "count": len(indices), "bufferView": position_view + 2})
         materials.append({"doubleSided": True, "pbrMetallicRoughness": {"baseColorFactor": list(color), "metallicFactor": 0}})
-        primitives.append({"attributes": {"POSITION": position_accessor, "NORMAL": normal_accessor}, "indices": index_accessor, "material": material_index, "mode": 4})
+        primitives_by_shape[shape_index].append({"attributes": {"POSITION": position_accessor, "NORMAL": normal_accessor}, "indices": index_accessor, "material": material_index, "mode": 4})
+
+    for part_index, primitives in enumerate(primitives_by_shape.values(), start=1):
+        name = f"Part {part_index}"
+        meshes.append({"name": name, "primitives": primitives})
+        nodes.append({"mesh": len(meshes) - 1, "name": name})
 
     document = {
         "asset": {"generator": "step-to-gltf", "version": "2.0"},
         "scene": 0,
-        "scenes": [{"nodes": [0]}],
-        "nodes": [{"mesh": 0, "name": output.stem}],
-        "meshes": [{"name": output.stem, "primitives": primitives}],
+        "scenes": [{"nodes": list(range(len(nodes)))}],
+        "nodes": nodes,
+        "meshes": meshes,
         "materials": materials,
         "accessors": accessors,
         "bufferViews": buffer_views,
@@ -246,7 +253,8 @@ def main() -> None:
         raise RuntimeError("No tessellated faces were found")
     output.parent.mkdir(parents=True, exist_ok=True)
     write_gltf(groups, output)
-    print(f"Wrote {output} and {output.with_suffix('.bin')} ({len(groups)} material groups)")
+    part_count = len({shape_index for shape_index, _ in groups})
+    print(f"Wrote {output} and {output.with_suffix('.bin')} ({part_count} parts, {len(groups)} material groups)")
 
 
 if __name__ == "__main__":
